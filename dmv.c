@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "postgres.h"
 #include "access/heapam.h"
@@ -15,17 +16,21 @@
 #include "utils/memutils.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
+#include "utils/pg_lsn.h"
 
 #include "dmv.h"
 
-#define TARGET 			":relname"
+#define TARGET 					":relname"
 #define DMV_TARGET_RELATIONS 	"_dmv_target_relations_"
-#define DMV_MV_RELATIONS 	"_dmv_mv_relations_"
-#define DMV_MV_TARGET	 	"_dmv_mv_target_"
-#define DMV_MV_LSN		"_dmv_mv_lsn_"
+#define DMV_MV_RELATIONS 		"_dmv_mv_relations_"
+#define DMV_MV_TARGET	 		"_dmv_mv_target_"
+#define DMV_MV_LSN				"_dmv_mv_lsn_"
+#define INT8OID					20
 
+bool WALread = false;
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(create_dmv);
+Datum lsn;
 
 void template_insert(Datum * args, bool * nulls, char * relname)
 {
@@ -102,7 +107,7 @@ void insert_dmv_lsn(Oid dmvOid)
 
 	memset(nulls, false, sizeof(nulls));
 
-	Datum lsn = DirectFunctionCall1(pg_current_wal_lsn, NULL);
+	lsn = DirectFunctionCall1(pg_current_wal_lsn, NULL);
 	double lsnDouble = (double) DatumGetUInt64(lsn);
 
 	values[0] = DirectFunctionCall1(float8_numeric, Float8GetDatum(lsnDouble));
@@ -126,7 +131,6 @@ void handle_query(char * mv_relname, char * query)
 	{
 		elog(ERROR, "invalid query");
 	}
-
 
 	foreach(cell, nodes)
 	{
@@ -164,6 +168,11 @@ void handle_query(char * mv_relname, char * query)
 
 	}
 
+	if (!WALread)
+	{
+		wal_read(dmvRelationOid, lsn);
+		WALread = true;
+	}
 }
 
 /*
@@ -175,7 +184,7 @@ Oid create_dmv_relation(char * relname, char * query)
 	Oid createdRelOid;
 
 	StringInfo createQuery = makeStringInfo();
-	appendStringInfo(createQuery, "create table %s as %s;", relname, query);
+	appendStringInfo(createQuery, "create table %s as %s", relname, query);
 
 	SPI_connect();
 	SPI_exec(createQuery->data, 1);
@@ -186,6 +195,24 @@ Oid create_dmv_relation(char * relname, char * query)
 	insert_dmv(createdRelOid, relname, query);
 	insert_dmv_lsn(createdRelOid);
 	return createdRelOid;
+}
+
+bool is_target(Oid oid)
+{
+	StringInfo createQuery = makeStringInfo();
+	appendStringInfoString(createQuery, "select rel_oid from _dmv_mv_target_ where rel_oid = $1");
+
+	// bigint OID
+	Oid argType[] = { INT8OID };
+	Datum argVals[] = { DatumGetObjectId(oid) };
+
+	SPI_connect();
+	SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
+	bool res = (SPI_processed == 1);
+
+	SPI_finish();
+
+	return res;
 }
 
 Datum create_dmv(PG_FUNCTION_ARGS)

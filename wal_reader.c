@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 #include "postgres.h"
 
@@ -16,10 +17,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 
 #include "dmv.h"
-
-PG_FUNCTION_INFO_V1(foo);
 
 typedef struct PrivateData
 {
@@ -28,17 +28,22 @@ typedef struct PrivateData
 } PrivateData;
 
 uint64 segno = 0;
-#define T_OID 16388	// t relation OID hardcoded	
+char *PG_WAL_DIR;
 
-Oid tempOid;
-Relation tempRel;
+void set_pg_wal_dir()
+{ 
+	StringInfo strInfo = makeStringInfo();
+	appendStringInfoString(strInfo, getenv("PGDATA"));
+	appendStringInfoString(strInfo, "/pg_wal/");
+	PG_WAL_DIR = strInfo->data;
+}
 
 /*
 	xlogreader.h call back funcs for reader
 	seg	WALOpenSegment field of reader
 */
-void
-WALSegmentOpen (XLogReaderState *xlogreader, XLogSegNo nextSegNo, TimeLineID *tli)
+
+void WALSegmentOpen (XLogReaderState *xlogreader, XLogSegNo nextSegNo, TimeLineID *tli)
 {
 	PrivateData *private_data = (PrivateData*) xlogreader->private_data;
 	xlogreader->seg.ws_file = open(private_data->file_path, O_RDONLY | PG_BINARY, 0);
@@ -49,8 +54,7 @@ WALSegmentOpen (XLogReaderState *xlogreader, XLogSegNo nextSegNo, TimeLineID *tl
 	}
 }
 
-void
-WALSegmentClose (XLogReaderState *xlogreader)
+void WALSegmentClose (XLogReaderState *xlogreader)
 {
 	close(xlogreader->seg.ws_file);
 	xlogreader->seg.ws_file = -1;
@@ -60,8 +64,7 @@ WALSegmentClose (XLogReaderState *xlogreader)
 	will be called by xlogreadrecord through bunch of funcs
 	readBuf is used to set state.readBuf
 */
-int
-XLogReadPageBlock (XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetRecPtr, char *readBuf)
+int XLogReadPageBlock(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetRecPtr, char *readBuf)
 {
 	PrivateData *private_data = (PrivateData *) xlogreader->private_data;
 	WALReadError errinfo;
@@ -80,8 +83,7 @@ XLogReadPageBlock (XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int re
 	return XLOG_BLCKSZ;
 }
 
-void
-getInfo (XLogReaderState *xlogreader)
+void getInfo (XLogReaderState *xlogreader)
 {
 	/* 
 		resource manager id from XLogRecord header of last read record by XLogReadRecord
@@ -100,18 +102,22 @@ getInfo (XLogReaderState *xlogreader)
 			{				
 				for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
 				{
-					RelFileNode rlocator;	// tablespace, db, relation oids, synonim for RelFileLocator
-					ForkNumber fork;			
-					BlockNumber block;		// page number
+					// tablespace, db, relation oids, synonim for RelFileLocator
+					RelFileNode rlocator;
+					ForkNumber fork;
+					// page number			
+					BlockNumber block;
 					Buffer readableBuf;
 
-					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;	// rlocator.relNumber - Oid
+					// rlocator.relNumber - Oid
+					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
 					if (fork != MAIN_FORKNUM) continue;
 
-					if (rlocator.relNode == T_OID) {
+					if (is_target(rlocator.relNode)) {
 
 						HeapTupleData readableTup;
-						ItemPointerData readablePointer;	// storage for OffsetNumber and BlockIdData
+						// storage for OffsetNumber and BlockIdData
+						ItemPointerData readablePointer;
 
 						// lsn is XLogRecPtr uint64,  uint32
 
@@ -121,29 +127,15 @@ getInfo (XLogReaderState *xlogreader)
 
 						// getting relation which changes we are reading
 						// AccessShareLock for read 
-						Relation readableRelation = table_open(T_OID, AccessShareLock);
+						Relation readableRelation = table_open(rlocator.relNode, AccessShareLock);
 		
 						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
 						{
-							CatalogTupleInsert(tempRel, &readableTup);
+							// CatalogTupleInsert(tempRel, &readableTup);
 							ReleaseBuffer(readableBuf);
 						}
 
 						table_close(readableRelation, AccessShareLock);
-
-						/*Datum rLSN = UInt64GetDatum(xlogreader->record->lsn);
-						Datum dLen = UInt32GetDatum(XLogRecGetDataLen(xlogreader));
-
-						Datum row[2] = { rLSN, dLen };
-
-						bool nulls[2];
-						memset(nulls, false, sizeof(nulls));						 
-
-						HeapTuple tuple = heap_form_tuple(RelationGetDescr(tempRel), row, nulls);
-
-						CatalogTupleInsert(tempRel, tuple);
-						heap_freetuple(tuple);
-						*/
 					}
 
 				}
@@ -153,14 +145,15 @@ getInfo (XLogReaderState *xlogreader)
 	}
 }
 
-void
-blockInfo (TimeLineID tli, PrivateData *private_data)
+
+XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data)
 {
 	XLogRecord 		*record;
 	XLogReaderState	*xlogreader;
 	XLogRecPtr		first_rec;
 	XLogRecPtr		cur_rec;
 	char			*errmsg;
+	XLogRecPtr 		last_rec;
 	
 	XLogReaderRoutine callbacks = { &XLogReadPageBlock, &WALSegmentOpen, &WALSegmentClose };
 
@@ -189,31 +182,60 @@ blockInfo (TimeLineID tli, PrivateData *private_data)
 			break;
 
 		if (errmsg)
-			elog(NOTICE, "%s", errmsg);
+			elog(ERROR, "%s", errmsg);
 
 		getInfo(xlogreader);
 	} while (record != NULL);
 
+	last_rec = xlogreader->ReadRecPtr;
 	XLogReaderFree(xlogreader);
+
+	return last_rec;
 }
 
-Datum wal_read(PG_FUNCTION_ARGS)
+void single_dmv_loop(Oid dmvOid, Datum dmvLSN)
 {
+	elog(NOTICE, "Oid: %d", dmvOid);
+	elog(NOTICE, "LSN: %ld", DatumGetLSN(dmvLSN));
 
-	// temp table routine
-	tempOid = DatumGetObjectId(DirectFunctionCall1(to_regclass, CStringGetTextDatum("temp")));
-	tempRel = table_open(tempOid, RowExclusiveLock);
+	XLogRecPtr lastRec;
+	char *fileName = DatumGetCString(DirectFunctionCall1(pg_walfile_name, dmvLSN));
+
+	elog(NOTICE, "lastRec: %ld", lastRec);
+	elog(NOTICE, "fileName preloop: %s", fileName);
 	
-	//elog(NOTICE, "sdffsd");
+	while (1)
+	{
+		elog(NOTICE, "loop LSN: %ld", DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL)));
+		if (DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL)) >= lastRec)
+		{
+			
+			PrivateData pr_data;
+			pr_data.file_path = strcat(PG_WAL_DIR, fileName);
+			pr_data.tli = 0;
 
-	PrivateData pr_data;
-	char *file_name = "000000010000000000000001";
-	pr_data.file_path = strcat(strcat(getenv("PGDATA"), "/pg_wal/"), file_name);
-	pr_data.tli = 0;
+			// sets tli and segno
+			XLogFromFileName(fileName, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
+			lastRec = blockInfo(pr_data.tli, &pr_data);		
 
-	// sets tli and segno
-	XLogFromFileName(file_name, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
-	blockInfo(pr_data.tli, &pr_data);
+			fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));
 
-	table_close(tempRel, RowExclusiveLock);
+			elog(NOTICE, "lastRec: %ld", lastRec);
+			elog(NOTICE, "fileName preloop: %s", fileName);
+		} 
+		else
+		{
+			/* 
+				if needed
+				update_dmv_lsn(dmvOid, lastRec);				
+			*/
+		}
+	}
+
+}
+
+void wal_read(Oid dmvOid, Datum LSN)
+{
+	set_pg_wal_dir();
+	single_dmv_loop(dmvOid, LSN);
 }

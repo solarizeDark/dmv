@@ -1,8 +1,4 @@
 create or replace function
-wal_read() returns void as 'MODULE_PATHNAME', 'foo'
-language c;
-
-create or replace function
 create_dmv(text, text) returns void as 'MODULE_PATHNAME', 'create_dmv'
 language c;
 
