@@ -112,7 +112,6 @@ void getInfo (XLogReaderState *xlogreader)
 					// rlocator.relNumber - Oid
 					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
 					if (fork != MAIN_FORKNUM) continue;
-
 					if (is_target(rlocator.relNode)) {
 
 						HeapTupleData readableTup;
@@ -129,6 +128,7 @@ void getInfo (XLogReaderState *xlogreader)
 						// AccessShareLock for read 
 						Relation readableRelation = table_open(rlocator.relNode, AccessShareLock);
 		
+						// tuple fetched here
 						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
 						{
 							// CatalogTupleInsert(tempRel, &readableTup);
@@ -139,40 +139,44 @@ void getInfo (XLogReaderState *xlogreader)
 					}
 
 				}
-				break;
 			}
 		}		
 	}
 }
 
 
-XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data)
+XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr firstRec)
 {
 	XLogRecord 		*record;
 	XLogReaderState	*xlogreader;
-	XLogRecPtr		first_rec;
-	XLogRecPtr		cur_rec;
+	XLogRecPtr		curRec;
+	// last read rec
+	XLogRecPtr		lastRec;
 	char			*errmsg;
-	XLogRecPtr 		last_rec;
 	
 	XLogReaderRoutine callbacks = { &XLogReadPageBlock, &WALSegmentOpen, &WALSegmentClose };
 
 	// macro to get RecPtr
-	XLogSegNoOffsetToRecPtr(segno, 0, DEFAULT_XLOG_SEG_SIZE, first_rec);
+	// XLogSegNoOffsetToRecPtr(segno, 0, DEFAULT_XLOG_SEG_SIZE, first_rec);
 
 	xlogreader = XLogReaderAllocate(DEFAULT_XLOG_SEG_SIZE, NULL, &callbacks, private_data);
+	elog(NOTICE, "blokcInfo firstRec: %ld", firstRec);
 
-	// finds first lsn >= first_rec
-	cur_rec = XLogFindNextRecord(xlogreader, first_rec);
+	/*
+		firstRec == create dmv function call lsn
+		finds first lsn >= firstRec
+	*/
+	curRec = XLogFindNextRecord(xlogreader, firstRec);
+	elog(NOTICE, "blockInfo curRec: %ld", curRec);
 
-	if (XLogRecPtrIsInvalid(cur_rec))
+	if (XLogRecPtrIsInvalid(curRec))
 	{
 		elog(NOTICE, "no log entries");
 		exit(0);
 	}
 
 	// just sets xlogreader fields including NextRecPtr
-	XLogBeginRead(xlogreader, cur_rec);
+	XLogBeginRead(xlogreader, curRec);
 
 	do
 	{
@@ -187,41 +191,35 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data)
 		getInfo(xlogreader);
 	} while (record != NULL);
 
-	last_rec = xlogreader->ReadRecPtr;
+	lastRec = xlogreader->ReadRecPtr;
 	XLogReaderFree(xlogreader);
 
-	return last_rec;
+	return lastRec;
 }
 
+/*
+	dmvLSN - point to start reading WAL from
+*/
 void single_dmv_loop(Oid dmvOid, Datum dmvLSN)
 {
-	elog(NOTICE, "Oid: %d", dmvOid);
-	elog(NOTICE, "LSN: %ld", DatumGetLSN(dmvLSN));
+	XLogRecPtr lastRec = DatumGetLSN(dmvLSN);
+	char *fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, dmvLSN)));
 
-	XLogRecPtr lastRec;
-	char *fileName = DatumGetCString(DirectFunctionCall1(pg_walfile_name, dmvLSN));
-
-	elog(NOTICE, "lastRec: %ld", lastRec);
-	elog(NOTICE, "fileName preloop: %s", fileName);
-	
 	while (1)
 	{
-		elog(NOTICE, "loop LSN: %ld", DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL)));
-		if (DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL)) >= lastRec)
+		XLogRecPtr curWALFileLSN = DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL));
+		if (curWALFileLSN >= lastRec)
 		{
-			
 			PrivateData pr_data;
 			pr_data.file_path = strcat(PG_WAL_DIR, fileName);
 			pr_data.tli = 0;
 
 			// sets tli and segno
 			XLogFromFileName(fileName, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
-			lastRec = blockInfo(pr_data.tli, &pr_data);		
+			lastRec = blockInfo(pr_data.tli, &pr_data, lastRec);		
 
 			fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));
 
-			elog(NOTICE, "lastRec: %ld", lastRec);
-			elog(NOTICE, "fileName preloop: %s", fileName);
 		} 
 		else
 		{

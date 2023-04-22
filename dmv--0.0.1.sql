@@ -4,25 +4,25 @@ language c;
 
 create table if not exists _dmv_target_relations_
 (
-	oid bigint,
+	rel_oid oid,
 	relname varchar
 );
 
 create table if not exists _dmv_mv_relations_
 (
-	oid bigint,
+	rel_oid oid,
 	relname varchar,
 	query text	
 );
 
 create table if not exists _dmv_mv_target_
 (
-	mv_oid bigint,
-	rel_oid bigint
+	mv_oid oid,
+	rel_oid oid
 );
 
 create table if not exists _dmv_mv_lsn_
 (
 	lsn numeric,
-	mv_oid bigint
+	mv_oid oid
 );

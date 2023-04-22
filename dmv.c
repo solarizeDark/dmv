@@ -38,7 +38,7 @@ void template_insert(Datum * args, bool * nulls, char * relname)
 	Oid oid;
 	HeapTuple tup;
 
-	oid = DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname));
+	oid = DatumGetObjectId(DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname)));
 
 	rel = table_open(oid, RowExclusiveLock);
 	tup = heap_form_tuple(RelationGetDescr(rel), args, nulls);
@@ -69,6 +69,10 @@ void insert_target(Oid targetOid, char * relname)
 */
 void insert_dmv(Oid dmvOid, char * relname, char * query)
 {
+
+	Oid oid;
+	oid = DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname));
+
 	Datum values[3];
 	bool nulls[3];
 
@@ -107,7 +111,7 @@ void insert_dmv_lsn(Oid dmvOid)
 
 	memset(nulls, false, sizeof(nulls));
 
-	lsn = DirectFunctionCall1(pg_current_wal_lsn, NULL);
+	lsn = (DirectFunctionCall1(pg_current_wal_lsn, NULL));
 	double lsnDouble = (double) DatumGetUInt64(lsn);
 
 	values[0] = DirectFunctionCall1(float8_numeric, Float8GetDatum(lsnDouble));
@@ -184,7 +188,7 @@ Oid create_dmv_relation(char * relname, char * query)
 	Oid createdRelOid;
 
 	StringInfo createQuery = makeStringInfo();
-	appendStringInfo(createQuery, "create table %s as %s", relname, query);
+	appendStringInfo(createQuery, "create table %s as %s;", relname, query);
 
 	SPI_connect();
 	SPI_exec(createQuery->data, 1);
