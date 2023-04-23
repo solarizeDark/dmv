@@ -39,7 +39,7 @@ void set_pg_wal_dir()
 }
 
 /*
-	xlogreader.h call back funcs for reader
+	xlogreader.h callback funcs for reader
 	seg	WALOpenSegment field of reader
 */
 
@@ -74,12 +74,7 @@ int XLogReadPageBlock(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int
 		elog(ERROR, "read page block error");
 		exit(1);
 	}
-	/*printf("%s\n", XLogRecGetData(xlogreader));
-	for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
-	{
-		printf("%d\n", i);
-	}
-	*/
+
 	return XLOG_BLCKSZ;
 }
 
@@ -93,6 +88,8 @@ void getInfo (XLogReaderState *xlogreader)
 	{
 		/*
 			XLR_RMGR_INFO_MASK 0xf0
+			top 4 bits for rmgr info
+			
 		*/
 		uint8 xlinfo = XLogRecGetInfo(xlogreader) & ~XLR_RMGR_INFO_MASK;
 		xlinfo &= XLOG_HEAP_OPMASK;
@@ -108,27 +105,30 @@ void getInfo (XLogReaderState *xlogreader)
 					// page number			
 					BlockNumber block;
 					Buffer readableBuf;
+					HeapTupleData readableTup;
+					/* 
+						storage for OffsetNumber and BlockIdData
+						offset - place of linp in page ItemIdData
+					*/
+					ItemPointerData readablePointer;
+					Relation readableRelation;
 
 					// rlocator.relNumber - Oid
 					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
 					if (fork != MAIN_FORKNUM) continue;
 					if (is_target(rlocator.relNode)) {
-
-						HeapTupleData readableTup;
-						// storage for OffsetNumber and BlockIdData
-						ItemPointerData readablePointer;
-
-						// lsn is XLogRecPtr uint64,  uint32
-
+						
 						xl_heap_insert *insert_info = (xl_heap_insert *) XLogRecGetData(xlogreader);
+						// setting of pointer to exact block & offset
 						ItemPointerSet(&readablePointer, block, insert_info->offnum); 
+						// pointer copied to a structure with tuple info
 						ItemPointerCopy(&readablePointer, &(readableTup.t_self));
 
 						// getting relation which changes we are reading
 						// AccessShareLock for read 
-						Relation readableRelation = table_open(rlocator.relNode, AccessShareLock);
+						readableRelation = table_open(rlocator.relNode, AccessShareLock);
 		
-						// tuple fetched here
+						// tid scan goes here by t_self in readableTup
 						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
 						{
 							// CatalogTupleInsert(tempRel, &readableTup);
@@ -161,7 +161,6 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 
 	xlogreader = XLogReaderAllocate(DEFAULT_XLOG_SEG_SIZE, NULL, &callbacks, private_data);
 	elog(NOTICE, "blokcInfo firstRec: %ld", firstRec);
-
 	/*
 		firstRec == create dmv function call lsn
 		finds first lsn >= firstRec
@@ -203,17 +202,24 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 void single_dmv_loop(Oid dmvOid, Datum dmvLSN)
 {
 	XLogRecPtr lastRec = DatumGetLSN(dmvLSN);
+	StringInfo filePath = makeStringInfo();
 	char *fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, dmvLSN)));
 
 	while (1)
 	{
-		XLogRecPtr curWALFileLSN = DatumGetLSN(DirectFunctionCall1(pg_switch_wal, NULL));
-		if (curWALFileLSN >= lastRec)
+		XLogRecPtr curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
+		if (curLSN >= lastRec)
 		{
+			initStringInfo(filePath);
+			appendStringInfo(filePath, "%s%s", PG_WAL_DIR, fileName);
+			
 			PrivateData pr_data;
-			pr_data.file_path = strcat(PG_WAL_DIR, fileName);
+			pr_data.file_path = filePath->data;
 			pr_data.tli = 0;
 
+			elog(NOTICE, "loop filename: %s", pr_data.file_path);
+
+			resetStringInfo(filePath);		
 			// sets tli and segno
 			XLogFromFileName(fileName, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
 			lastRec = blockInfo(pr_data.tli, &pr_data, lastRec);		
@@ -228,6 +234,7 @@ void single_dmv_loop(Oid dmvOid, Datum dmvLSN)
 				update_dmv_lsn(dmvOid, lastRec);				
 			*/
 		}
+		break;
 	}
 
 }
