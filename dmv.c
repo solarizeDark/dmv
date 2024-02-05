@@ -17,18 +17,18 @@
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "utils/pg_lsn.h"
+#include "postmaster/bgworker.h"
 
 #include "dmv.h"
 
 #define TARGET 					":relname"
-#define DMV_TARGET_RELATIONS 	"_dmv_target_relations_"
-#define DMV_MV_RELATIONS 		"_dmv_mv_relations_"
-#define DMV_MV_TARGET	 		"_dmv_mv_target_"
-#define DMV_MV_LSN				"_dmv_mv_lsn_"
+#define DMV_TARGET_RELATIONS 	"_dmv_target_relations_"		/* oid, name of base relations 		*/
+#define DMV_MV_RELATIONS 		"_dmv_mv_relations_"			/* oid, name, forming query of dmv 	*/
+#define DMV_MV_TARGET	 		"_dmv_mv_target_"				/* many to many dmv - base rel		*/
+#define DMV_MV_LSN				"_dmv_mv_lsn_"					/* WAL reading start point 			*/
 #define INT8OID					20
 
 bool WALread = false;
-PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(create_dmv);
 Datum lsn;
 
@@ -48,9 +48,7 @@ void template_insert(Datum * args, bool * nulls, char * relname)
 	table_close(rel, RowExclusiveLock);
 }
 
-/*
-	inserting to metadata table oid and name of tables on which view is based
-*/
+/* inserting to metadata table oid and name of tables on which view is based */
 void insert_target(Oid targetOid, char * relname)
 {
 	Datum values[2];
@@ -64,12 +62,10 @@ void insert_target(Oid targetOid, char * relname)
 	template_insert(values, nulls, DMV_TARGET_RELATIONS);
 }
 
-/*
-	inserting to metadata table oid, name and query of view creation
-*/
+/* inserting to metadata table oid, name and query of view creation */
 void insert_dmv(Oid dmvOid, char * relname, char * query)
 {
-
+	// elog(NOTICE, "%s\n", "insert_dmv");
 	Oid oid;
 	oid = DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname));
 
@@ -101,9 +97,7 @@ void insert_dmv_target(Oid targetOid, Oid dmvOid)
 	template_insert(values, nulls, DMV_MV_TARGET);
 }
 
-/*
-	metadata with lsn and view relation
-*/
+/* metadata with lsn and view relation */
 void insert_dmv_lsn(Oid dmvOid)
 {
 	Datum values[2];
@@ -111,7 +105,7 @@ void insert_dmv_lsn(Oid dmvOid)
 
 	memset(nulls, false, sizeof(nulls));
 
-	lsn = (DirectFunctionCall1(pg_current_wal_lsn, NULL));
+	lsn = DirectFunctionCall1(pg_current_wal_lsn, NULL);
 	double lsnDouble = (double) DatumGetUInt64(lsn);
 
 	values[0] = DirectFunctionCall1(float8_numeric, Float8GetDatum(lsnDouble));
@@ -174,15 +168,32 @@ void handle_query(char * mv_relname, char * query)
 
 	if (!WALread)
 	{
-		wal_read(dmvRelationOid, lsn);
+		bgworkerArgs = palloc(sizeof(BGWorkerArgs));
+		bgworkerArgs->dmvOid = dmvRelationOid;
+		bgworkerArgs->lsn = lsn;		
+
+		BgwHandleStatus status;
+		BackgroundWorkerHandle *handle;
+		elog(NOTICE, "%d", wal_reader_pid);
+
+/*		status = GetBackgroundWorkerPid(handle, &wal_reader_pid);
+		elog(NOTICE, "%s", "presig");
+
+		if (status != BGWH_STARTED)
+		{
+			elog(NOTICE, "%s", "worker didnt start");	
+		}
+*/
+		if (kill(wal_reader_pid, SIGUSR1) != 0)
+		{
+			elog(NOTICE, "%s", "sig send fail");
+		}	
+
 		WALread = true;
 	}
 }
 
-/*
-	mat view relation creation
-	returns oid of created table
-*/
+/* dmv relation creation, returns oid of created table */
 Oid create_dmv_relation(char * relname, char * query)
 {
 	Oid createdRelOid;
@@ -215,10 +226,12 @@ bool is_target(Oid oid)
 	bool res = (SPI_processed == 1);
 
 	SPI_finish();
+	CommitTransactionCommand();
 
 	return res;
 }
 
+/* args: dmv name, dmv query */
 Datum create_dmv(PG_FUNCTION_ARGS)
 {
 	text *relname = PG_GETARG_TEXT_PP(0);
@@ -226,6 +239,5 @@ Datum create_dmv(PG_FUNCTION_ARGS)
 
 	char *relnameCString = text_to_cstring(relname);
 	char *queryCString = text_to_cstring(query);
-
 	handle_query(relnameCString, queryCString);
 }

@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #include "postgres.h"
 
@@ -18,6 +21,8 @@
 #include "utils/snapmgr.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
 
 #include "dmv.h"
 
@@ -27,15 +32,20 @@ typedef struct PrivateData
 	TimeLineID	tli;
 } PrivateData;
 
+PG_MODULE_MAGIC;
+
+pid_t wal_reader_pid = -1;
 uint64 segno = 0;
 char *PG_WAL_DIR;
+static volatile sig_atomic_t gotSignal = false;
 
 void set_pg_wal_dir()
 { 
 	StringInfo strInfo = makeStringInfo();
 	appendStringInfoString(strInfo, getenv("PGDATA"));
 	appendStringInfoString(strInfo, "/pg_wal/");
-	PG_WAL_DIR = strInfo->data;
+	strcpy(PG_WAL_DIR, strInfo->data);
+	free(strInfo);
 }
 
 /*
@@ -49,8 +59,11 @@ void WALSegmentOpen (XLogReaderState *xlogreader, XLogSegNo nextSegNo, TimeLineI
 	xlogreader->seg.ws_file = open(private_data->file_path, O_RDONLY | PG_BINARY, 0);
 	if (xlogreader->seg.ws_file < 0)
 	{
-		fprintf(stderr, "file open error\n");
+		elog(NOTICE, "%s", private_data->file_path);
+		elog(ERROR, "%s", "file open error\n");
 		exit(1);
+	} else {
+		elog(NOTICE, "reading: %s", private_data->file_path);		
 	}
 }
 
@@ -71,7 +84,7 @@ int XLogReadPageBlock(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int
 	bool wal_read_res = WALRead(xlogreader, readBuf, targetPagePtr, XLOG_BLCKSZ, private_data->tli, &errinfo); 
 	if (!WALRead(xlogreader, readBuf, targetPagePtr, XLOG_BLCKSZ, private_data->tli, &errinfo))
 	{
-		elog(ERROR, "read page block error");
+		elog(ERROR, "%s", "read page block error");
 		exit(1);
 	}
 
@@ -100,7 +113,7 @@ void getInfo (XLogReaderState *xlogreader)
 				for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
 				{
 					// tablespace, db, relation oids, synonim for RelFileLocator
-					RelFileNode rlocator;
+					RelFileLocator rlocator;
 					ForkNumber fork;
 					// page number			
 					BlockNumber block;
@@ -116,7 +129,9 @@ void getInfo (XLogReaderState *xlogreader)
 					// rlocator.relNumber - Oid
 					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
 					if (fork != MAIN_FORKNUM) continue;
-					if (is_target(rlocator.relNode)) {
+					if (is_target(rlocator.relNumber)) {
+
+						elog(NOTICE, "%s", "LOOP");
 						
 						xl_heap_insert *insert_info = (xl_heap_insert *) XLogRecGetData(xlogreader);
 						// setting of pointer to exact block & offset
@@ -126,7 +141,7 @@ void getInfo (XLogReaderState *xlogreader)
 
 						// getting relation which changes we are reading
 						// AccessShareLock for read 
-						readableRelation = table_open(rlocator.relNode, AccessShareLock);
+						readableRelation = table_open(rlocator.relNumber, AccessShareLock);
 		
 						// tid scan goes here by t_self in readableTup
 						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
@@ -144,7 +159,6 @@ void getInfo (XLogReaderState *xlogreader)
 	}
 }
 
-
 XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr firstRec)
 {
 	XLogRecord 		*record;
@@ -160,18 +174,23 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 	// XLogSegNoOffsetToRecPtr(segno, 0, DEFAULT_XLOG_SEG_SIZE, first_rec);
 
 	xlogreader = XLogReaderAllocate(DEFAULT_XLOG_SEG_SIZE, NULL, &callbacks, private_data);
-	elog(NOTICE, "blokcInfo firstRec: %ld", firstRec);
+
+	if (xlogreader == NULL)
+	{
+		elog(NOTICE, "%s", "null reader");
+	}
+
 	/*
 		firstRec == create dmv function call lsn
 		finds first lsn >= firstRec
 	*/
 	curRec = XLogFindNextRecord(xlogreader, firstRec);
-	elog(NOTICE, "blockInfo curRec: %ld", curRec);
 
 	if (XLogRecPtrIsInvalid(curRec))
 	{
+		elog(NOTICE, "curRec %ld", firstRec);
 		elog(NOTICE, "no log entries");
-		exit(0);
+		return -1;
 	}
 
 	// just sets xlogreader fields including NextRecPtr
@@ -199,48 +218,98 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 /*
 	dmvLSN - point to start reading WAL from
 */
-void single_dmv_loop(Oid dmvOid, Datum dmvLSN)
+void* single_dmv_loop(void* args) // (Oid dmvOid, Datum dmvLSN)
 {
-	XLogRecPtr lastRec = DatumGetLSN(dmvLSN);
+	BGWorkerArgs* arg = (BGWorkerArgs*) args;
+	
+	XLogRecPtr lastRec = DatumGetLSN(arg->lsn);
 	StringInfo filePath = makeStringInfo();
-	char *fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, dmvLSN)));
+
+	XLogRecPtr curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
+
+	elog(NOTICE, "preloop lsn: %ld", lastRec);
+	elog(NOTICE, "preloop cur rec: %ld", curLSN);
+	
+	char *fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, arg->lsn)));
 
 	while (1)
 	{
-		XLogRecPtr curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
 		if (curLSN >= lastRec)
 		{
 			initStringInfo(filePath);
 			appendStringInfo(filePath, "%s%s", PG_WAL_DIR, fileName);
-			
+				
 			PrivateData pr_data;
 			pr_data.file_path = filePath->data;
 			pr_data.tli = 0;
 
-			elog(NOTICE, "loop filename: %s", pr_data.file_path);
-
-			resetStringInfo(filePath);		
 			// sets tli and segno
 			XLogFromFileName(fileName, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
 			lastRec = blockInfo(pr_data.tli, &pr_data, lastRec);		
-
-			fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));
-
+			elog(NOTICE, "last rec: %ld", lastRec);
+			if (lastRec == -1) 
+			{
+				elog(NOTICE, "%s", "sleep");
+				sleep(20);
+			} else 
+			{
+				fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));		
+			}
 		} 
 		else
 		{
-			/* 
-				if needed
-				update_dmv_lsn(dmvOid, lastRec);				
-			*/
+			elog(NOTICE, "loop cur rec: %ld", curLSN);
+			sleep(20);			
 		}
-		break;
+
+		curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
+
 	}
 
 }
 
-void wal_read(Oid dmvOid, Datum LSN)
+static void sig_handler(SIGNAL_ARGS)
+{
+	gotSignal = true;
+}
+
+sig_atomic_t got_sigterm = false;
+static void reader_sig_term(SIGNAL_ARGS)
+{
+	got_sigterm = true;
+}
+
+void wal_read(Datum main_arg) //Oid dmvOid, Datum LSN)
+{
+	pqsignal(SIGTERM, reader_sig_term);
+	BackgroundWorkerUnblockSignals();
+	while (!got_sigterm)
+	{
+		elog(NOTICE,"%s", "no signal");
+		sleep(20);
+	}
+	
+	pthread_t thread;
+	pthread_create(&thread, NULL, single_dmv_loop, (void *)&bgworkerArgs);
+	pthread_join(thread, NULL);
+}
+
+void _PG_init(void)
 {
 	set_pg_wal_dir();
-	single_dmv_loop(dmvOid, LSN);
+	elog(NOTICE, "%s", PG_WAL_DIR);
+	// ereport(INFO, "FOO");
+
+/*
+	BackgroundWorker worker;
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_PostmasterStart;
+	worker.bgw_restart_time = 1;
+	sprintf(worker.bgw_library_name, "dmv");
+	sprintf(worker.bgw_function_name, "wal_read");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "walreader");	
+	RegisterBackgroundWorker(&worker);
+	wal_reader_pid = MyProcPid;
+*/
 }
