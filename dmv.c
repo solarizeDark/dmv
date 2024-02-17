@@ -42,6 +42,10 @@ void template_insert(Datum * args, bool * nulls, char * relname)
 
 	rel = table_open(oid, RowExclusiveLock);
 	tup = heap_form_tuple(RelationGetDescr(rel), args, nulls);
+	/* 
+		CatalogTupleInsert
+		https://doxygen.postgresql.org/indexing_8c_source.html#l00233
+	*/
 	CatalogTupleInsert(rel, tup);
 
 	heap_freetuple(tup);
@@ -105,7 +109,11 @@ void insert_dmv_lsn(Oid dmvOid)
 
 	memset(nulls, false, sizeof(nulls));
 
-	lsn = DirectFunctionCall1(pg_current_wal_lsn, NULL);
+	/* 
+		pg_current_wal_lsn
+		https://doxygen.postgresql.org/xlogfuncs_8c_source.html#l00279 
+	*/
+	lsn = (Datum) DirectFunctionCall1(pg_current_wal_lsn, NULL);
 	double lsnDouble = (double) DatumGetUInt64(lsn);
 
 	values[0] = DirectFunctionCall1(float8_numeric, Float8GetDatum(lsnDouble));
@@ -138,6 +146,7 @@ void handle_query(char * mv_relname, char * query)
 	dmvRelationOid = create_dmv_relation(mv_relname, query);
 
 	token = strtok(namecpy, " ");
+	elog(NOTICE, "token: %s", token);
 
 	while (token)
 	{
@@ -148,6 +157,7 @@ void handle_query(char * mv_relname, char * query)
 		}
 
 		token = strtok(NULL, " ");
+		elog(NOTICE, "token: %s", token);
 
 		if (flag)
 		{
@@ -166,11 +176,11 @@ void handle_query(char * mv_relname, char * query)
 
 	}
 
-	if (!WALread)
+	if (!WALread && 0)
 	{
-		bgworkerArgs = palloc(sizeof(BGWorkerArgs));
-		bgworkerArgs->dmvOid = dmvRelationOid;
-		bgworkerArgs->lsn = lsn;		
+		// bgworkerArgs = palloc(sizeof(BGWorkerArgs));
+		// bgworkerArgs->dmvOid = dmvRelationOid;
+		// bgworkerArgs->lsn = lsn;		
 
 		BgwHandleStatus status;
 		BackgroundWorkerHandle *handle;
@@ -184,10 +194,10 @@ void handle_query(char * mv_relname, char * query)
 			elog(NOTICE, "%s", "worker didnt start");	
 		}
 */
-		if (kill(wal_reader_pid, SIGUSR1) != 0)
-		{
-			elog(NOTICE, "%s", "sig send fail");
-		}	
+		// if (kill(wal_reader_pid, SIGUSR1) != 0)
+		// {
+		// 	elog(NOTICE, "%s", "sig send fail");
+		// }	
 
 		WALread = true;
 	}

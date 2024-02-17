@@ -11,7 +11,7 @@ typedef struct
 } BGWorkerArgs;
 
 extern pid_t wal_reader_pid;
-BGWorkerArgs *bgworkerArgs;
+// BGWorkerArgs *bgworkerArgs;
 
 Datum create_dmv(PG_FUNCTION_ARGS);
 Oid create_dmv_relation(char * relname, char * query);
