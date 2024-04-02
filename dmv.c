@@ -246,7 +246,7 @@ bool is_target(Oid oid)
 	Oid argType[] = { INT8OID };
 	Datum argVals[] = { ObjectIdGetDatum(oid) };
 	
-	StartTransactionCommand();
+	// StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
         elog(ERROR, "Cannot connect to SPI manager");
@@ -284,8 +284,8 @@ bool is_target(Oid oid)
     }
     PG_END_TRY();
 	PopActiveSnapshot();
-	CommitTransactionCommand();
-		elog(NOTICE, "CommitTransactionCommand");
+	// CommitTransactionCommand();
+		// elog(NOTICE, "CommitTransactionCommand");
 
 	return res;
 }

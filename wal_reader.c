@@ -282,10 +282,18 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 {
 	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 	BackgroundWorkerUnblockSignals();
-	elog(NOTICE, "[wal_read]\tpreloop is_target");
+
+	StartTransactionCommand();
+
+	elog(NOTICE, "[getInfo]\tpre table_open");
+	Relation dmvRelation = table_open((Oid) 156211, RowExclusiveLock);
+	elog(NOTICE, "[getInfo]\tpre is_target");
 	bool res = is_target(156211);
 	elog(NOTICE, "[wal_read]\tafter is_target");
+	table_close(dmvRelation, RowExclusiveLock);
+	CommitTransactionCommand();
 	return;
+
 	StringInfo filePath = makeStringInfo();
 
 	XLogRecPtr curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
