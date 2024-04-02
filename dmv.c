@@ -19,6 +19,13 @@
 #include "utils/pg_lsn.h"
 #include "postmaster/bgworker.h"
 
+#include "access/amapi.h"
+#include "access/htup_details.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+
 #include "dmv.h"
 
 #define TARGET 					":relname"
@@ -28,7 +35,29 @@
 #define DMV_MV_LSN				"_dmv_mv_lsn_"					/* WAL reading start point 			*/
 #define INT8OID					20
 
-bool WALread = false;
+PG_FUNCTION_INFO_V1(dmv_test);
+Datum dmv_test(PG_FUNCTION_ARGS) {
+	Relation rel;
+    HeapTuple tup;
+    TableScanDesc scan;
+    Oid tbl_oid = 164403;
+	elog(NOTICE, "[wal_read]\tTEST");
+
+    rel = table_open(tbl_oid, AccessShareLock);
+	elog(NOTICE, "[wal_read]\tTESTEND");
+
+    scan = table_beginscan(rel, GetTransactionSnapshot(), 0, NULL);
+
+    while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        tupleP_p record = (tupleP_p) GETSTRUCT(tup);
+		elog(NOTICE, "[T]\tc_col: %d", record->c1);
+    }
+
+    table_endscan(scan);
+    table_close(rel, AccessShareLock);
+}
+
 PG_FUNCTION_INFO_V1(create_dmv);
 Datum lsn;
 
@@ -59,6 +88,8 @@ void insert_target(Oid targetOid, char * relname)
 	bool nulls[2];
 
 	memset(nulls, false, sizeof(nulls));
+
+	elog(NOTICE, "[insert_target]\t targetOid: %d", targetOid);
 
 	values[0] = ObjectIdGetDatum(targetOid);
 	values[1] = CStringGetTextDatum(relname);
@@ -114,6 +145,7 @@ void insert_dmv_lsn(Oid dmvOid)
 		https://doxygen.postgresql.org/xlogfuncs_8c_source.html#l00279 
 	*/
 	lsn = (Datum) DirectFunctionCall1(pg_current_wal_lsn, NULL);
+	// elog(NOTICE, "[insert_dmv_lsn]\t%ld", DatumGetUInt64(lsn));
 	double lsnDouble = (double) DatumGetUInt64(lsn);
 
 	values[0] = DirectFunctionCall1(float8_numeric, Float8GetDatum(lsnDouble));
@@ -146,7 +178,7 @@ void handle_query(char * mv_relname, char * query)
 	dmvRelationOid = create_dmv_relation(mv_relname, query);
 
 	token = strtok(namecpy, " ");
-	elog(NOTICE, "token: %s", token);
+	// elog(NOTICE, "token: %s", token);
 
 	while (token)
 	{
@@ -157,7 +189,7 @@ void handle_query(char * mv_relname, char * query)
 		}
 
 		token = strtok(NULL, " ");
-		elog(NOTICE, "token: %s", token);
+		// elog(NOTICE, "token: %s", token);
 
 		if (flag)
 		{
@@ -176,31 +208,6 @@ void handle_query(char * mv_relname, char * query)
 
 	}
 
-	if (!WALread && 0)
-	{
-		// bgworkerArgs = palloc(sizeof(BGWorkerArgs));
-		// bgworkerArgs->dmvOid = dmvRelationOid;
-		// bgworkerArgs->lsn = lsn;		
-
-		BgwHandleStatus status;
-		BackgroundWorkerHandle *handle;
-		elog(NOTICE, "%d", wal_reader_pid);
-
-/*		status = GetBackgroundWorkerPid(handle, &wal_reader_pid);
-		elog(NOTICE, "%s", "presig");
-
-		if (status != BGWH_STARTED)
-		{
-			elog(NOTICE, "%s", "worker didnt start");	
-		}
-*/
-		// if (kill(wal_reader_pid, SIGUSR1) != 0)
-		// {
-		// 	elog(NOTICE, "%s", "sig send fail");
-		// }	
-
-		WALread = true;
-	}
 }
 
 /* dmv relation creation, returns oid of created table */
@@ -224,19 +231,61 @@ Oid create_dmv_relation(char * relname, char * query)
 
 bool is_target(Oid oid)
 {
+	elog(NOTICE, "is_target called");
+	// Portal portal;
+	// MemoryContext oldcontext;
+
 	StringInfo createQuery = makeStringInfo();
+	elog(NOTICE, "makeStringInfo");
+	
 	appendStringInfoString(createQuery, "select rel_oid from _dmv_mv_target_ where rel_oid = $1");
+	elog(NOTICE, "appendStringInfoString");
+
 
 	// bigint OID
 	Oid argType[] = { INT8OID };
-	Datum argVals[] = { DatumGetObjectId(oid) };
+	Datum argVals[] = { ObjectIdGetDatum(oid) };
+	
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "Cannot connect to SPI manager");
+	elog(NOTICE, "SPI_connect");
+		
+	// oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	// if (oldcontext != NULL) {
+	// 	elog(NOTICE, "old cont exists");
+	// }
+	bool res;
+	PG_TRY();
+	{
+		// portal = SPI_cursor_open(NULL, NULL, NULL, NULL, true);
+		// if (portal != NULL)
+		// 	elog(NOTICE, "portal exists");
 
-	SPI_connect();
-	SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
-	bool res = (SPI_processed == 1);
+		// MemoryContextSwitchTo(oldcontext);
+		int ret = SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
+		elog(NOTICE, "SPI_execute_with_args");
 
-	SPI_finish();
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "Failed to execute query");
+		res = (SPI_processed != 0);
+		elog(NOTICE, "SPI_processed: %d", SPI_processed);
+		SPI_finish();
+		elog(NOTICE, "SPI_finish");
+		// SPI_cursor_close(portal);
+	}
+	PG_CATCH();
+    {
+        /* Handle error */
+        ErrorData *errdata = CopyErrorData();
+        FlushErrorState();
+        elog(ERROR, "Exception occurred: %s", errdata->message);
+    }
+    PG_END_TRY();
+	PopActiveSnapshot();
 	CommitTransactionCommand();
+		elog(NOTICE, "CommitTransactionCommand");
 
 	return res;
 }
@@ -251,3 +300,9 @@ Datum create_dmv(PG_FUNCTION_ARGS)
 	char *queryCString = text_to_cstring(query);
 	handle_query(relnameCString, queryCString);
 }
+
+/* temp */
+// Oid get_target_relation()
+// {
+
+// }
