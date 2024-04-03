@@ -151,7 +151,7 @@ void getInfo (XLogReaderState *xlogreader)
 
 					/* setting rlocator, fork, block */
 					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
-					if (fork != MAIN_FORKNUM) continue;		/* other forks for metadata */
+					if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
 					if (is_target(rlocator.relNumber) || 1) { 	/* rlocator.relNumber - OID of relation */
 
 						/* record main_data */
@@ -282,17 +282,6 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 {
 	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 	BackgroundWorkerUnblockSignals();
-
-	StartTransactionCommand();
-
-	elog(NOTICE, "[getInfo]\tpre table_open");
-	Relation dmvRelation = table_open((Oid) 156211, RowExclusiveLock);
-	elog(NOTICE, "[getInfo]\tpre is_target");
-	bool res = is_target(156211);
-	elog(NOTICE, "[wal_read]\tafter is_target");
-	table_close(dmvRelation, RowExclusiveLock);
-	CommitTransactionCommand();
-	return;
 
 	StringInfo filePath = makeStringInfo();
 

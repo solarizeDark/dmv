@@ -232,8 +232,6 @@ Oid create_dmv_relation(char * relname, char * query)
 bool is_target(Oid oid)
 {
 	elog(NOTICE, "is_target called");
-	// Portal portal;
-	// MemoryContext oldcontext;
 
 	StringInfo createQuery = makeStringInfo();
 	elog(NOTICE, "makeStringInfo");
@@ -246,46 +244,23 @@ bool is_target(Oid oid)
 	Oid argType[] = { INT8OID };
 	Datum argVals[] = { ObjectIdGetDatum(oid) };
 	
-	// StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
         elog(ERROR, "Cannot connect to SPI manager");
 	elog(NOTICE, "SPI_connect");
 		
-	// oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	// if (oldcontext != NULL) {
-	// 	elog(NOTICE, "old cont exists");
-	// }
 	bool res;
-	PG_TRY();
-	{
-		// portal = SPI_cursor_open(NULL, NULL, NULL, NULL, true);
-		// if (portal != NULL)
-		// 	elog(NOTICE, "portal exists");
+	int ret = SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
+	elog(NOTICE, "SPI_execute_with_args");
 
-		// MemoryContextSwitchTo(oldcontext);
-		int ret = SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
-		elog(NOTICE, "SPI_execute_with_args");
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "Failed to execute query");
+	res = (SPI_processed != 0);
+	elog(NOTICE, "SPI_processed: %d", SPI_processed);
+	SPI_finish();
+	elog(NOTICE, "SPI_finish");
 
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "Failed to execute query");
-		res = (SPI_processed != 0);
-		elog(NOTICE, "SPI_processed: %d", SPI_processed);
-		SPI_finish();
-		elog(NOTICE, "SPI_finish");
-		// SPI_cursor_close(portal);
-	}
-	PG_CATCH();
-    {
-        /* Handle error */
-        ErrorData *errdata = CopyErrorData();
-        FlushErrorState();
-        elog(ERROR, "Exception occurred: %s", errdata->message);
-    }
-    PG_END_TRY();
 	PopActiveSnapshot();
-	// CommitTransactionCommand();
-		// elog(NOTICE, "CommitTransactionCommand");
 
 	return res;
 }
