@@ -42,7 +42,7 @@ typedef struct PrivateData
 
 PG_MODULE_MAGIC;
 
-static XLogSegNo segno = 0;
+static XLogSegNo segno = 1;
 static char PG_WAL_DIR[50];
 static int wal_reader_sleep_time = 5; 
 
@@ -109,11 +109,8 @@ void getInfo (XLogReaderState *xlogreader)
 	Datum lsn = (Datum) DirectFunctionCall1(pg_current_wal_lsn, NULL);
 	elog(NOTICE, "[getInfo]\tcurLSN: %ld", DatumGetUInt64(lsn));
 
-	Relation dmvRelation = table_open((Oid) 156211, RowExclusiveLock);
-
-	if (dmvRelation == NULL) {
-		elog(ERROR, "Failed to open relation with OID 139822");
-	}
+	elog(NOTICE, "[getInfo]\ttrying to open: 16412");
+	Relation dmvRelation = table_open((Oid) 16412, RowExclusiveLock);
 
 	/* 
 		XLogRecGet* fetchs info of xlogreader->record which is most recently read DecodedXLogRecord
@@ -148,11 +145,17 @@ void getInfo (XLogReaderState *xlogreader)
 					HeapTupleData readableTup;
 					ItemPointerData readablePointer;	/* storage for OffsetNumber and BlockIdData, offset - place of linp in page ItemIdData */
 					Relation readableRelation;
+					Oid targetOid;
 
 					/* setting rlocator, fork, block */
 					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
 					if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
-					if (is_target(rlocator.relNumber) || 1) { 	/* rlocator.relNumber - OID of relation */
+					
+
+					elog(NOTICE, "[getInfo]\tcheck if target.spcOid: %d", rlocator.spcOid);
+					elog(NOTICE, "[getInfo]\tcheck if target.dbOid: %d", rlocator.dbOid);
+					elog(NOTICE, "[getInfo]\tcheck if target.relNumber: %d", rlocator.relNumber);
+					if (targetOid = is_target(rlocator.relNumber)) { 		/* rlocator.relNumber - OID of relation */
 
 						/* record main_data */
 						xl_heap_insert *insert_info = (xl_heap_insert *) XLogRecGetData(xlogreader);
@@ -165,7 +168,8 @@ void getInfo (XLogReaderState *xlogreader)
 							getting relation which changes we are reading
 							AccessShareLock for select (lockdefs.h)
 						*/
-						readableRelation = table_open(rlocator.relNumber, AccessShareLock);
+						elog(NOTICE, "[getInfo]\ttrying to open target relation: %d", targetOid);
+						readableRelation = table_open(targetOid, AccessShareLock);
 
 						/* tid scan goes here by t_self in readableTup */
 						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
@@ -188,9 +192,9 @@ void getInfo (XLogReaderState *xlogreader)
 	CommitTransactionCommand();
 }
 
-XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr firstRec)
+XLogRecPtr blockInfo(PrivateData *private_data, XLogRecPtr firstRec)
 {
-	elog(NOTICE, "blockInfo started");
+	elog(NOTICE, "[blockInfo]\tblockInfo started");
 	XLogRecord 		*record;
 	XLogReaderState	*xlogreader;
 	XLogRecPtr		curRec;
@@ -208,15 +212,23 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 
 	if (xlogreader == NULL)
 	{
-		elog(ERROR, "%s", "null reader");
+		elog(ERROR, "%s", "[blockInfo]\tnull reader");
 	}
 
 	/* firstRec == create dmv function call lsn, finds first lsn >= firstRec and positions reader to that point */
+	elog(NOTICE, "[blockInfo]\tfirstRec: %ld", firstRec);
 	curRec = XLogFindNextRecord(xlogreader, firstRec);
+
+	elog(NOTICE, "[blockInfo]\tcurRec: %ld", curRec);
 
 	if (XLogRecPtrIsInvalid(curRec))
 	{
-		elog(NOTICE, "no log entries");
+		/* */
+		elog(NOTICE, "[blockInfo]\tstate->seg.ws_segno: %d", xlogreader->seg.ws_segno == 0);
+		elog(NOTICE, "[blockInfo]\tstate->segoff: %d", xlogreader->segoff == 0);
+		elog(NOTICE, "[blockInfo]\tstate->readLen: %d", xlogreader->readLen == 0);
+		elog(NOTICE, "[blockInfo]\tstate->errormes: %s", xlogreader->errormsg_buf);
+		elog(NOTICE, "[blockInfo]\tXLogRecPtrIsInvalid");
 	}
 
 	/* just sets xlogreader fields including NextRecPtr and EndRecPtr, doesnt read WAL yet */
@@ -231,7 +243,10 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 		*/
 		record = XLogReadRecord(xlogreader, &errmsg); 
 		if (record == NULL)
+		{
+			elog(NOTICE, "[blockInfo]\tnull record");
 			break;
+		}
 
 		if (errmsg)
 			elog(ERROR, "[blockInfo]\t%s", errmsg);
@@ -246,36 +261,6 @@ XLogRecPtr blockInfo(TimeLineID tli, PrivateData *private_data, XLogRecPtr first
 	return lastRec;
 }
 
-void test()
-{
-	elog(NOTICE, "[TEST]\tTEST1");
-	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
-	
-	StartTransactionCommand();
-	(void) GetTransactionSnapshot();
-
-	Relation rel;
-    HeapTuple tup;
-    TableScanDesc scan;
-    Oid tbl_oid = 164403;
-	elog(NOTICE, "[TEST]\tTEST2");
-
-    rel = table_open(tbl_oid, AccessShareLock);
-
-    scan = table_beginscan(rel, GetTransactionSnapshot(), 0, NULL);
-
-    while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-    {
-        tupleP_p record = (tupleP_p) GETSTRUCT(tup);
-		elog(NOTICE, "[T]\tc_col: %d", record->c1);
-    }
-
-    table_endscan(scan);
-    table_close(rel, AccessShareLock);
-	CommitTransactionCommand();
-	elog(NOTICE, "[TEST]\tTESTEND");
-}
-
 /* to make function visible */
 // void wal_read(Datum main_arg) __attribute__((visibility("default")));
 extern PGDLLEXPORT void wal_read(Datum main_arg)
@@ -286,18 +271,13 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 	StringInfo filePath = makeStringInfo();
 
 	XLogRecPtr curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
-	/* 
-		! 
-		have to be min(lsn) from _dmv_mv_lsn_ table 
-		for restart case 
-	*/
 	XLogRecPtr lastRec = curLSN;
 
 	elog(NOTICE, "[wal_read]\tpreloop cur rec: %ld", curLSN);
 	
 	/* getting wal file by lsn */
 	char *fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));
-
+	int nonfirst = 0;
 	for(;;)
 	{
 		(void) WaitLatch(MyLatch,
@@ -306,7 +286,8 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 				PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 
-		if (curLSN >= lastRec)
+		elog(NOTICE, "[wal_read]\tcurLsn >= lastRec: %d", curLSN >= lastRec);
+		if (curLSN >= lastRec || nonfirst)
 		{
 			/* constructing fullpath to wal file */
 			initStringInfo(filePath);
@@ -318,26 +299,32 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 			{
 				PrivateData pr_data;
 				pr_data.file_path = filePath->data;
-				pr_data.tli = 0;
+				pr_data.tli = 1;
 
 				/* sets tli and segno */
-				XLogFromFileName(fileName, &pr_data.tli, &segno, DEFAULT_XLOG_SEG_SIZE);
 
-				lastRec = blockInfo(pr_data.tli, &pr_data, lastRec);		
-				elog(NOTICE, "[wal_read]\tlastRec after blockInfo: %ld", lastRec);
-				if (lastRec == -1) 
+				lastRec = blockInfo(&pr_data, lastRec);
+				if (!XLogRecPtrIsInvalid(lastRec)) 
 				{
-					// TODO
+					fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, lastRec)));
+					elog(NOTICE, "[wal_read]\tfileName via pg_walfile_name: %s", fileName);
+				} else {
+					lastRec = curLSN;
+					elog(NOTICE, "[wal_read]\tlastRec ptr is invalid: %ld", lastRec);
 				}
+				// else
+				// {
+				// 	segno++;
+				// 	elog(NOTICE, "[wal_read]\tsegno: %ld", segno);
+				// 	XLogFileName(fileName, pr_data.tli, segno, DEFAULT_XLOG_SEG_SIZE);
+				// 	elog(NOTICE, "[wal_read]\tfileName after end of segment: %s", fileName);
+				// }
+				elog(NOTICE, "[wal_read]\tlastRec after blockInfo: %ld", lastRec);
 			}
-			else
-			{
-				lastRec = curLSN;
-			}
+			nonfirst = 1;
 		}
 
-		fileName = text_to_cstring(DatumGetTextP(DirectFunctionCall1(pg_walfile_name, ++lastRec)));		
-		curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
+		// curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
 	}
 }
 

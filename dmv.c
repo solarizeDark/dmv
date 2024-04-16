@@ -89,7 +89,7 @@ void insert_target(Oid targetOid, char * relname)
 
 	memset(nulls, false, sizeof(nulls));
 
-	elog(NOTICE, "[insert_target]\t targetOid: %d", targetOid);
+	elog(NOTICE, "[insert_target]\t target Oid: %d", targetOid);
 
 	values[0] = ObjectIdGetDatum(targetOid);
 	values[1] = CStringGetTextDatum(relname);
@@ -229,16 +229,14 @@ Oid create_dmv_relation(char * relname, char * query)
 	return createdRelOid;
 }
 
-bool is_target(Oid oid)
+Oid is_target(RelFileNumber oid)
 {
-	elog(NOTICE, "is_target called");
+	elog(NOTICE, "[is_target]\trelfilenode: %d", oid);
+	bool isnull;
+	Oid target;
 
 	StringInfo createQuery = makeStringInfo();
-	elog(NOTICE, "makeStringInfo");
-	
-	appendStringInfoString(createQuery, "select rel_oid from _dmv_mv_target_ where rel_oid = $1");
-	elog(NOTICE, "appendStringInfoString");
-
+	appendStringInfoString(createQuery, "select	dtr.rel_oid	from _dmv_target_relations_ dtr join pg_class p on dtr.rel_oid = p.oid	where p.relfilenode = $1");
 
 	// bigint OID
 	Oid argType[] = { INT8OID };
@@ -246,23 +244,30 @@ bool is_target(Oid oid)
 	
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
-        elog(ERROR, "Cannot connect to SPI manager");
-	elog(NOTICE, "SPI_connect");
+        elog(ERROR, "[is_target]\tCannot connect to SPI manager");
 		
 	bool res;
 	int ret = SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
-	elog(NOTICE, "SPI_execute_with_args");
 
 	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "Failed to execute query");
-	res = (SPI_processed != 0);
-	elog(NOTICE, "SPI_processed: %d", SPI_processed);
+		elog(ERROR, "[is_target]\tFailed to execute query");
+
+	if (SPI_processed == 0)
+	{
+		elog(NOTICE, "[is_target]\t%d is not target", oid);
+		target = 0;
+	}
+	else
+	{
+		char *result = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		target = DatumGetInt64(DirectFunctionCall1(int8in, CStringGetDatum(result)));
+		elog(NOTICE, "[is_target]\tTarget OID: %d", target);
+		// target = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, false));
+	}
+
 	SPI_finish();
-	elog(NOTICE, "SPI_finish");
-
 	PopActiveSnapshot();
-
-	return res;
+	return target;
 }
 
 /* args: dmv name, dmv query */

@@ -29,7 +29,7 @@ void insert_target(Oid targetOid, char * relname);
 void insert_dmv(Oid dmvOid, char * relname, char * query);
 void insert_dmv_lsn(Oid dmvOid);
 void handle_query(char * mv_relname, char * query);
-bool is_target(Oid relOid);
+Oid is_target(Oid relOid);
 // void wal_read(Datum main_arg);
 Oid get_target_relation();
 
