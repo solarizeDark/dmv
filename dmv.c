@@ -18,14 +18,28 @@
 #include "lib/stringinfo.h"
 #include "utils/pg_lsn.h"
 #include "postmaster/bgworker.h"
-
 #include "access/amapi.h"
 #include "access/htup_details.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "access/genam.h"
 
+#include "access/xact.h"
+#include "catalog/dependency.h"
+#include "catalog/indexing.h"
+#include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_namespace_d.h"
+#include "catalog/pg_trigger_d.h"
+#include "commands/trigger.h"
+#include "parser/analyze.h"
+#include "parser/scansup.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/regproc.h"
+#include "utils/varlena.h"
 #include "dmv.h"
 
 #define TARGET 					":relname"
@@ -98,20 +112,21 @@ void insert_target(Oid targetOid, char * relname)
 }
 
 /* inserting to metadata table oid, name and query of view creation */
-void insert_dmv(Oid dmvOid, char * relname, char * query)
+void insert_dmv(Oid dmvOid, char * relname, char * query, char* parsed)
 {
 	// elog(NOTICE, "%s\n", "insert_dmv");
 	Oid oid;
 	oid = DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname));
 
-	Datum values[3];
-	bool nulls[3];
+	Datum values[4];
+	bool nulls[4];
 
 	memset(nulls, false, sizeof(nulls));
 
 	values[0] = ObjectIdGetDatum(dmvOid);
 	values[1] = CStringGetTextDatum(relname);
 	values[2] = CStringGetTextDatum(query);
+	values[3] = CStringGetTextDatum(parsed);
 
 	template_insert(values, nulls, DMV_MV_RELATIONS);
 }
@@ -174,7 +189,7 @@ void handle_query(char * mv_relname, char * query)
 	{
 		namecpy = nodeToString(lfirst(cell));
 	}
-
+	// elog(NOTICE, "[handle_query]\tnamecpy: %s", namecpy);
 	dmvRelationOid = create_dmv_relation(mv_relname, query);
 
 	token = strtok(namecpy, " ");
@@ -213,6 +228,46 @@ void handle_query(char * mv_relname, char * query)
 /* dmv relation creation, returns oid of created table */
 Oid create_dmv_relation(char * relname, char * query)
 {
+	List	*parsetree_list;
+	RawStmt	*parsetree;
+	Query	*queryObj;
+	char    *relnameCopy = pstrdup(relname);
+	List	*names = NIL;
+
+	ParseState *pstate = make_parsestate(NULL);
+	CreateTableAsStmt *ctas;
+	StringInfoData command_buf;
+
+	names = stringToQualifiedNameList(relnameCopy, NULL);
+
+	pstate->p_sourcetext = command_buf.data;
+
+	/* raw parsing */
+	parsetree_list = pg_parse_query(query);
+	parsetree = linitial_node(RawStmt, parsetree_list);
+
+	ctas = makeNode(CreateTableAsStmt);
+	ctas->query = parsetree->stmt;
+	ctas->objtype = OBJECT_MATVIEW;
+	ctas->is_select_into = false;
+	ctas->into = makeNode(IntoClause);
+	ctas->into->rel = makeRangeVarFromNameList(names);
+	ctas->into->colNames = NIL;
+	ctas->into->accessMethod = NULL;
+	ctas->into->options = NIL;
+	ctas->into->onCommit = ONCOMMIT_NOOP;
+	ctas->into->tableSpaceName = NULL;
+	ctas->into->viewQuery = parsetree->stmt;
+	ctas->into->skipData = false;
+
+	queryObj = transformStmt(pstate, (Node *)ctas);
+
+	CreateTableAsStmt *ctasStmt = queryObj->utilityStmt;
+	/* IntoClause *into = ctasStmt->into; */
+	Query *viewQuery = (Query *) ctasStmt->into->viewQuery;
+
+	pfree(relnameCopy);
+
 	Oid createdRelOid;
 
 	StringInfo createQuery = makeStringInfo();
@@ -224,7 +279,7 @@ Oid create_dmv_relation(char * relname, char * query)
 
 	createdRelOid = DatumGetObjectId(DirectFunctionCall1(to_regclass, CStringGetTextDatum(relname)));
 
-	insert_dmv(createdRelOid, relname, query);
+	insert_dmv(createdRelOid, relname, query, nodeToString((Node *) viewQuery));
 	insert_dmv_lsn(createdRelOid);
 	return createdRelOid;
 }
@@ -281,8 +336,40 @@ Datum create_dmv(PG_FUNCTION_ARGS)
 	handle_query(relnameCString, queryCString);
 }
 
-/* temp */
-// Oid get_target_relation()
-// {
+Query* get_dmv_query(Oid oid)
+{
+	bool isnull;
 
-// }
+	StringInfo createQuery = makeStringInfo();
+	appendStringInfoString(createQuery, "select	dmr.parsed from _dmv_mv_relations_ dmr where dmr.rel_oid = $1");
+
+	// bigint OID
+	Oid argType[] = { INT8OID };
+	Datum argVals[] = { ObjectIdGetDatum(oid) };
+	
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "[get_dmv_query]\tCannot connect to SPI manager");
+		
+	bool res;
+	int ret = SPI_execute_with_args(createQuery->data, 1, argType, argVals, NULL, true, 1);
+
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "[get_dmv_query]\tFailed to execute query");
+
+	Query* query;
+	if (SPI_processed == 0)
+	{
+		elog(NOTICE, "[get_dmv_query]\t%d is not target", oid);
+	}
+	else
+	{
+		char *result = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		elog(NOTICE, "[get_dmv_query]\tresult: %s", result);
+		query = (Query *) stringToNode(result);;
+	}
+
+	SPI_finish();
+	PopActiveSnapshot();
+	return query;
+}

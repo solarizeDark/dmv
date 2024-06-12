@@ -1,5 +1,5 @@
 MODULE_big = dmv
-OBJS = dmv.o wal_reader.o
+OBJS = dmv.o wal_reader.o update.o
 DATA = dmv--0.0.1.sql
 EXTENSION = dmv
 

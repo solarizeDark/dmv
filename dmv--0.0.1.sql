@@ -18,7 +18,8 @@ create table if not exists _dmv_mv_relations_
 (
 	rel_oid oid,
 	relname varchar,
-	query text	
+	query text,
+	parsed text
 );
 
 /* mat view - target relation */

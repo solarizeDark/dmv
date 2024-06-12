@@ -109,9 +109,8 @@ void getInfo (XLogReaderState *xlogreader)
 	Datum lsn = (Datum) DirectFunctionCall1(pg_current_wal_lsn, NULL);
 	elog(NOTICE, "[getInfo]\tcurLSN: %ld", DatumGetUInt64(lsn));
 
-	elog(NOTICE, "[getInfo]\ttrying to open: 16412");
-	Relation dmvRelation = table_open((Oid) 16412, RowExclusiveLock);
-
+	Oid dmvOid = (Oid) 24746;
+	Relation dmvRelation = table_open(dmvOid, RowExclusiveLock);
 	/* 
 		XLogRecGet* fetchs info of xlogreader->record which is most recently read DecodedXLogRecord
 		
@@ -122,6 +121,16 @@ void getInfo (XLogReaderState *xlogreader)
 	/* look at rmgrlist.h for constants */
 	if (xlrmid == RM_HEAP_ID)
 	{
+		RelFileLocator rlocator; 			/* tablespace, db, relation */
+		ForkNumber fork;					/* type of physical file for relation, we need main fork, other forks for metadata */
+		BlockNumber block;					/* page number */
+		Buffer readableBuf;
+		HeapTupleData readableTup;
+		ItemPointerData readablePointer;	/* storage for OffsetNumber and BlockIdData, offset - place of linp in page ItemIdData */
+		Relation readableRelation;
+		Oid targetOid;
+		TupleDesc tupleDesc;
+
 		/*
 			example at heapam.c heap_redo()
 			xlinfo: type of operation
@@ -132,58 +141,143 @@ void getInfo (XLogReaderState *xlogreader)
 		/* heapam_xlog.h */
 		xlinfo &= XLOG_HEAP_OPMASK;
 		elog(NOTICE, "[getInfo]\tswitch");
+		elog(NOTICE, "[getInfo]\txlinfo: %d", xlinfo);
 		switch(xlinfo)
 		{
 			case XLOG_HEAP_INSERT:
-			{
-				for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
+			case XLOG_HEAP2_MULTI_INSERT:
 				{
-					RelFileLocator rlocator; 			/* tablespace, db, relation */
-					ForkNumber fork;					/* type of physical file for relation, we need main fork, other forks for metadata */
-					BlockNumber block;					/* page number */
-					Buffer readableBuf;
-					HeapTupleData readableTup;
-					ItemPointerData readablePointer;	/* storage for OffsetNumber and BlockIdData, offset - place of linp in page ItemIdData */
-					Relation readableRelation;
-					Oid targetOid;
+					for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
+					{
+						/* setting rlocator, fork, block */
+						if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
+						if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
+						
 
-					/* setting rlocator, fork, block */
-					if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
-					if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
-					
+						elog(NOTICE, "[getInfo][INSERT]\tcheck if target.spcOid: %d", rlocator.spcOid);
+						elog(NOTICE, "[getInfo][INSERT]\tcheck if target.dbOid: %d", rlocator.dbOid);
+						elog(NOTICE, "[getInfo][INSERT]\tcheck if target.relNumber: %d", rlocator.relNumber);
+						if (targetOid = is_target(rlocator.relNumber)) { 		/* rlocator.relNumber - OID of relation */
 
-					elog(NOTICE, "[getInfo]\tcheck if target.spcOid: %d", rlocator.spcOid);
-					elog(NOTICE, "[getInfo]\tcheck if target.dbOid: %d", rlocator.dbOid);
-					elog(NOTICE, "[getInfo]\tcheck if target.relNumber: %d", rlocator.relNumber);
-					if (targetOid = is_target(rlocator.relNumber)) { 		/* rlocator.relNumber - OID of relation */
+							/* record main_data */
+							xl_heap_insert *insert_info = (xl_heap_insert *) XLogRecGetData(xlogreader);
+							/* setting of pointer to exact block & offset (which is index of linp) */
+							ItemPointerSet(&readablePointer, block, insert_info->offnum); 
+							/* pointer copied to a structure with tuple info */
+							ItemPointerCopy(&readablePointer, &(readableTup.t_self));
 
-						/* record main_data */
-						xl_heap_insert *insert_info = (xl_heap_insert *) XLogRecGetData(xlogreader);
-						/* setting of pointer to exact block & offset (which is index of linp) */
-						ItemPointerSet(&readablePointer, block, insert_info->offnum); 
-						/* pointer copied to a structure with tuple info */
-						ItemPointerCopy(&readablePointer, &(readableTup.t_self));
+							/*
+								getting relation which changes we are reading
+								AccessShareLock for select (lockdefs.h)
+							*/
+							elog(NOTICE, "[getInfo][INSERT]\ttrying to open target relation: %d", targetOid);
+							readableRelation = table_open(targetOid, AccessShareLock);
+							
+							tupleDesc = RelationGetDescr(readableRelation);
+							/* tid scan goes here by t_self in readableTup */
+							if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
+							{
+								elog(NOTICE, "[getInfo][INSERT]\tCatalogTupleInsert");
+								update(dmvOid, dmvRelation, &readableTup, tupleDesc, 'i');
+								ReleaseBuffer(readableBuf);
+							}
 
-						/*
-							getting relation which changes we are reading
-							AccessShareLock for select (lockdefs.h)
-						*/
-						elog(NOTICE, "[getInfo]\ttrying to open target relation: %d", targetOid);
-						readableRelation = table_open(targetOid, AccessShareLock);
-
-						/* tid scan goes here by t_self in readableTup */
-						if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
-						{
-							elog(NOTICE, "[getInfo]\tCatalogTupleInsert");
-							CatalogTupleInsert(dmvRelation, &readableTup);
-							ReleaseBuffer(readableBuf);
+							table_close(readableRelation, AccessShareLock);
 						}
 
-						table_close(readableRelation, AccessShareLock);
 					}
-
 				}
-			}
+				break;
+			
+			case XLOG_HEAP_DELETE:
+				{
+					elog(NOTICE, "[getInfo][XLOG_HEAP_DELETE]");
+					for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
+					{
+						/* setting rlocator, fork, block */
+						if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
+						if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
+						
+						if (targetOid = is_target(rlocator.relNumber)) { 		/* rlocator.relNumber - OID of relation */
+
+							/* record main_data */
+							xl_heap_delete *delete_info = (xl_heap_delete *) XLogRecGetData(xlogreader);
+							/* setting of pointer to exact block & offset (which is index of linp) */
+							ItemPointerSet(&readablePointer, block, delete_info->offnum); 
+							/* pointer copied to a structure with tuple info */
+							ItemPointerCopy(&readablePointer, &(readableTup.t_self));
+
+							/*
+								getting relation which changes we are reading
+								AccessShareLock for select (lockdefs.h)
+							*/
+							elog(NOTICE, "[getInfo][DELETE]\ttrying to open target relation: %d", targetOid);
+							readableRelation = table_open(targetOid, AccessShareLock);
+
+							/* tid scan goes here by t_self in readableTup */
+							if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
+							{
+								elog(NOTICE, "[getInfo][DELETE]\tCatalogTupleDelete");
+								// update(dmvOid, dmvRelation, &readableTup, 'd');
+								ReleaseBuffer(readableBuf);
+							}
+
+							table_close(readableRelation, AccessShareLock);
+						}
+
+					}
+				}
+				break;
+			
+			case XLOG_HEAP_UPDATE:
+			case XLOG_HEAP_HOT_UPDATE:
+				{
+					elog(NOTICE, "[getInfo][XLOG_HEAP_UPDATE]");
+					for (int i = 0; i <= XLogRecMaxBlockId(xlogreader); i++)
+					{
+						RelFileLocator rlocator; 			/* tablespace, db, relation */
+						ForkNumber fork;					/* type of physical file for relation, we need main fork, other forks for metadata */
+						BlockNumber block;					/* page number */
+						Buffer readableBuf;
+						HeapTupleData readableTup;
+						ItemPointerData readablePointer;	/* storage for OffsetNumber and BlockIdData, offset - place of linp in page ItemIdData */
+						Relation readableRelation;
+						Oid targetOid;
+
+						/* setting rlocator, fork, block */
+						if (!XLogRecGetBlockTagExtended(xlogreader, i, &rlocator, &fork, &block, NULL)) continue;
+						if (fork != MAIN_FORKNUM) continue;			/* other forks for metadata */
+						
+						if (targetOid = is_target(rlocator.relNumber)) { 		/* rlocator.relNumber - OID of relation */
+
+							/* record main_data */
+							xl_heap_update *update_info = (xl_heap_update *) XLogRecGetData(xlogreader);
+							/* setting of pointer to exact block & offset (which is index of linp) */
+							ItemPointerSet(&readablePointer, block, update_info->new_offnum); 
+							/* pointer copied to a structure with tuple info */
+							ItemPointerCopy(&readablePointer, &(readableTup.t_self));
+
+							/*
+								getting relation which changes we are reading
+								AccessShareLock for select (lockdefs.h)
+							*/
+							elog(NOTICE, "[getInfo]\ttrying to open target relation: %d", targetOid);
+							readableRelation = table_open(targetOid, AccessShareLock);
+
+							/* tid scan goes here by t_self in readableTup */
+							if (heap_fetch(readableRelation, SnapshotAny, &readableTup, &readableBuf, false))
+							{
+								elog(NOTICE, "[getInfo]\tCatalogTupleInsert");
+								// update(dmvOid, dmvRelation, &readableTup, 'u');
+								ReleaseBuffer(readableBuf);
+							}
+
+							table_close(readableRelation, AccessShareLock);
+						}
+
+					}
+				}
+				break;
 		}		
 	}
 
@@ -312,24 +406,17 @@ extern PGDLLEXPORT void wal_read(Datum main_arg)
 					lastRec = curLSN;
 					elog(NOTICE, "[wal_read]\tlastRec ptr is invalid: %ld", lastRec);
 				}
-				// else
-				// {
-				// 	segno++;
-				// 	elog(NOTICE, "[wal_read]\tsegno: %ld", segno);
-				// 	XLogFileName(fileName, pr_data.tli, segno, DEFAULT_XLOG_SEG_SIZE);
-				// 	elog(NOTICE, "[wal_read]\tfileName after end of segment: %s", fileName);
-				// }
+
 				elog(NOTICE, "[wal_read]\tlastRec after blockInfo: %ld", lastRec);
 			}
 			nonfirst = 1;
 		}
-
-		// curLSN = DatumGetLSN(DirectFunctionCall1(pg_current_wal_lsn, NULL));
 	}
 }
 
 void _PG_init(void)
 {
+	storeInit = 0;
 	set_pg_wal_dir();
 	if (!process_shared_preload_libraries_in_progress)
 	{
